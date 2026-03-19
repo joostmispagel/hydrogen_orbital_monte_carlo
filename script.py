@@ -6,83 +6,114 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 from numba import njit
 
 
-# --- 1. Wahrscheinlichkeitsdichten (PDFs) mit Numba ---
-# Durch @njit werden diese Funktionen in extrem schnellen Maschinencode übersetzt.
+# --- 1. Allgemeine Mathematische Kernfunktionen (Numba) ---
 
 @njit
-def pdf_1s(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return np.exp(-2 * r)
-
-
-@njit
-def pdf_2s(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return (2 - r) ** 2 * np.exp(-r)
+def fact(n):
+    """Berechnet die Fakultät für die Polynome."""
+    if n <= 1: return 1.0
+    res = 1.0
+    for i in range(2, int(n) + 1):
+        res *= float(i)
+    return res
 
 
 @njit
-def pdf_2pz(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return (z ** 2) * np.exp(-r)
+def assoc_laguerre(p, k, x):
+    """Zugeordnete Laguerre-Polynome für den radialen Teil."""
+    res = 0.0
+    for i in range(p + 1):
+        num = fact(p + k)
+        den = fact(p - i) * fact(k + i)
+        term = ((-1) ** i) * (num / den) * (x ** i) / fact(i)
+        res += term
+    return res
 
 
 @njit
-def pdf_2px(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return (x ** 2) * np.exp(-r)
+def assoc_legendre(l, m, x):
+    """Zugeordnete Legendre-Polynome für den winkelabhängigen Teil."""
+    m = abs(m)
+    # Begrenzung zur Vermeidung von Floating-Point Ungenauigkeiten
+    if x > 1.0: x = 1.0
+    if x < -1.0: x = -1.0
+
+    res = 0.0
+    for k in range(int((l - m) / 2) + 1):
+        num = fact(2 * l - 2 * k)
+        den = (2 ** l) * fact(k) * fact(l - k) * fact(l - 2 * k - m)
+        term = ((-1) ** k) * (num / den) * (x ** (l - 2 * k - m))
+        res += term
+    return ((-1) ** m) * (np.sqrt(1.0 - x ** 2) ** m) * res
 
 
 @njit
-def pdf_2py(x, y, z):
+def atomic_pdf(x, y, z, n, l, m):
+    """Die universelle wasserstoffähnliche Wellenfunktion quadriert (PDF)."""
     r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return (y ** 2) * np.exp(-r)
+    if r < 1e-10:
+        r = 1e-10  # Verhindert Division durch Null
+
+    # Radialer Teil R(r)
+    rho = 2.0 * r / n
+    rad_part = np.exp(-r / n) * (rho ** l) * assoc_laguerre(n - l - 1, 2 * l + 1, rho)
+
+    # Winkelabhängiger Teil Y(theta, phi)
+    cos_theta = z / r
+    phi = np.arctan2(y, x)
+
+    p_lm = assoc_legendre(l, m, cos_theta)
+
+    # Reelle sphärische Harmonische (für die Visualisierung in der Chemie üblich)
+    if m == 0:
+        ang_part = p_lm
+    elif m > 0:
+        ang_part = p_lm * np.cos(m * phi)
+    else:
+        ang_part = p_lm * np.sin(abs(m) * phi)
+
+    return (rad_part * ang_part) ** 2
 
 
-@njit
-def pdf_3dz2(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return ((3 * z ** 2 - r ** 2) ** 2) * np.exp(-2 * r / 3)
-
-
-@njit
-def pdf_3dx2y2(x, y, z):
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    return ((x ** 2 - y ** 2) ** 2) * np.exp(-2 * r / 3)
-
-
+# --- Molekülfunktionen (Bleiben bestehen) ---
 @njit
 def pdf_h2_bonding(x, y, z):
     r1 = np.sqrt(x ** 2 + y ** 2 + (z - 0.7) ** 2)
     r2 = np.sqrt(x ** 2 + y ** 2 + (z + 0.7) ** 2)
-    psi1 = np.exp(-r1)
-    psi2 = np.exp(-r2)
-    return (psi1 + psi2) ** 2
+    return (np.exp(-r1) + np.exp(-r2)) ** 2
 
 
 @njit
 def pdf_h2_antibonding(x, y, z):
     r1 = np.sqrt(x ** 2 + y ** 2 + (z - 0.7) ** 2)
     r2 = np.sqrt(x ** 2 + y ** 2 + (z + 0.7) ** 2)
-    psi1 = np.exp(-r1)
-    psi2 = np.exp(-r2)
-    return (psi1 - psi2) ** 2
+    return (np.exp(-r1) - np.exp(-r2)) ** 2
 
 
-# --- 2. Metropolis-Hastings Algorithmus mit Numba ---
+# --- Weichensteller für Numba ---
 @njit
-def metropolis_hastings(pdf, num_points=30000, thin=5, step_size=1.0):
+def evaluate_pdf(x, y, z, orb_type, n, l, m):
+    """Entscheidet innerhalb der kompilierten Schleife, was berechnet wird."""
+    if orb_type == 0:
+        return atomic_pdf(x, y, z, n, l, m)
+    elif orb_type == 1:
+        return pdf_h2_bonding(x, y, z)
+    else:
+        return pdf_h2_antibonding(x, y, z)
+
+
+# --- 2. Universeller Metropolis-Hastings ---
+@njit
+def metropolis_hastings(orb_type, n, l, m, num_points=30000, thin=5, step_size=1.0):
     total_steps = num_points * thin
     points = np.zeros((num_points, 3))
 
-    # Skalare Variablen sind in Numba oft schneller als Arrays in Schleifen
     x, y, z = 1.0, 1.0, 1.0
-    current_prob = pdf(x, y, z)
+    current_prob = evaluate_pdf(x, y, z, orb_type, n, l, m)
 
     accepted_points = 0
 
     for i in range(total_steps):
-        # Einzelne Zufallszahlen generieren ist in Numba blitzschnell
         step_x = np.random.normal(0.0, step_size)
         step_y = np.random.normal(0.0, step_size)
         step_z = np.random.normal(0.0, step_size)
@@ -91,7 +122,7 @@ def metropolis_hastings(pdf, num_points=30000, thin=5, step_size=1.0):
         prop_y = y + step_y
         prop_z = z + step_z
 
-        proposal_prob = pdf(prop_x, prop_y, prop_z)
+        proposal_prob = evaluate_pdf(prop_x, prop_y, prop_z, orb_type, n, l, m)
 
         if current_prob == 0.0:
             acceptance = 1.0
@@ -115,136 +146,206 @@ def metropolis_hastings(pdf, num_points=30000, thin=5, step_size=1.0):
 class OrbitalApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Interaktive Wasserstoff-Orbitale & H2-Molekül (Numba Optimized)')
-        self.setGeometry(100, 100, 1000, 800)
-
+        self.setWindowTitle('Universeller Orbital-Generator (n, l, m)')
+        self.setGeometry(100, 100, 1100, 800)
         self.setStyleSheet("""
-                    QWidget { background-color: #0b0c10; color: #c5c6c7; font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; }
-                    QComboBox { background-color: #1f2833; border: 1px solid #45a29e; padding: 6px 12px; border-radius: 4px; color: #ffffff; }
-                    QComboBox::drop-down { border: 0px; }
-                    QComboBox:hover { border: 1px solid #66fcf1; }
-                    QSpinBox { background-color: #1f2833; border: 1px solid #45a29e; padding: 6px 25px 6px 12px; border-radius: 4px; color: #ffffff; }
-                    QSpinBox:hover { border: 1px solid #66fcf1; }
-                    QSpinBox::up-button { subcontrol-origin: border; subcontrol-position: top right; width: 20px; border-left: 1px solid #45a29e; background-color: #2b3746; border-top-right-radius: 3px; }
-                    QSpinBox::down-button { subcontrol-origin: border; subcontrol-position: bottom right; width: 20px; border-left: 1px solid #45a29e; background-color: #2b3746; border-bottom-right-radius: 3px; }
-                    QSpinBox::up-button:hover, QSpinBox::down-button:hover { background-color: #45a29e; }
+                    QWidget { 
+                        background-color: #0b0c10; 
+                        color: #c5c6c7; 
+                        font-family: 'Segoe UI'; 
+                        font-size: 14px; 
+                    }
+                    QComboBox, QSpinBox { 
+                        background-color: #1f2833; 
+                        border: 1px solid #45a29e; 
+                        padding: 4px; 
+                        border-radius: 4px; 
+                        color: #ffffff; 
+                    }
+                    QLabel { 
+                        font-weight: bold; 
+                        margin-left: 10px; 
+                    }
+
+                    /* --- Fix für die QSpinBox Pfeile (Schaltflächen) --- */
+                    QSpinBox::up-button {
+                        subcontrol-origin: border;
+                        subcontrol-position: top right;
+                        width: 20px;
+                        border-left: 1px solid #45a29e;
+                        background-color: #1f2833;
+                        border-top-right-radius: 3px;
+                    }
+                    QSpinBox::down-button {
+                        subcontrol-origin: border;
+                        subcontrol-position: bottom right;
+                        width: 20px;
+                        border-left: 1px solid #45a29e;
+                        background-color: #1f2833;
+                        border-bottom-right-radius: 3px;
+                    }
+
+                    /* Hover-Effekt für die Buttons */
+                    QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                        background-color: #45a29e;
+                    }
+
+                    /* CSS-Dreiecke als Pfeilersatz */
+                    QSpinBox::up-arrow {
+                        width: 0px; height: 0px;
+                        border-left: 4px solid transparent;
+                        border-right: 4px solid transparent;
+                        border-bottom: 5px solid #c5c6c7;
+                    }
+                    QSpinBox::down-arrow {
+                        width: 0px; height: 0px;
+                        border-left: 4px solid transparent;
+                        border-right: 4px solid transparent;
+                        border-top: 5px solid #c5c6c7;
+                    }
+
+                    /* Pfeilfarbe ändert sich beim Hovern (Kontrast) */
+                    QSpinBox::up-arrow:hover { border-bottom: 5px solid #0b0c10; }
+                    QSpinBox::down-arrow:hover { border-top: 5px solid #0b0c10; }
                 """)
+
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
         self.setLayout(main_layout)
 
+        # Toolbar
         toolbar = QWidget()
         toolbar.setStyleSheet("background-color: #111217; border-bottom: 1px solid #1f2833;")
-        toolbar_layout = QHBoxLayout()
-        toolbar_layout.setContentsMargins(20, 12, 20, 12)
-        toolbar.setLayout(toolbar_layout)
+        toolbar_layout = QHBoxLayout(toolbar)
 
-        label_orbital = QLabel("Orbital:")
-        label_orbital.setStyleSheet("font-weight: bold; border: none;")
-        toolbar_layout.addWidget(label_orbital)
-
+        # Modus Auswahl
+        toolbar_layout.addWidget(QLabel("Modus:"))
         self.combo = QComboBox()
         self.combo.addItems([
-            "1s Orbital (Kugel)",
-            "2s Orbital (Knotenfläche)",
-            "2p_x Orbital (Hantel X-Achse)",
-            "2p_y Orbital (Hantel Y-Achse)",
-            "2p_z Orbital (Hantel Z-Achse)",
-            "3d_z² Orbital (Hantel mit Donut)",
-            "3d_x²-y² Orbital (Kleeblatt)",
-            "H2 Molekül (bindendes σ-Orbital)",
-            "H2 Molekül (antibindendes σ*-Orbital)"
+            "Atomares Orbital (via Quantenzahlen)",
+            "H2 Molekül (bindend)",
+            "H2 Molekül (antibindend)"
         ])
-        self.combo.currentIndexChanged.connect(self.update_orbital)
+        self.combo.currentIndexChanged.connect(self.toggle_mode)
         toolbar_layout.addWidget(self.combo)
 
-        label_points = QLabel("Punkte:")
-        label_points.setStyleSheet("font-weight: bold; border: none; margin-left: 20px;")
-        toolbar_layout.addWidget(label_points)
+        # Quantenzahlen
+        self.label_n = QLabel("n:")
+        self.spin_n = QSpinBox()
+        self.spin_n.setRange(1, 15)
+        self.spin_n.setValue(3)
 
+        self.label_l = QLabel("l:")
+        self.spin_l = QSpinBox()
+        self.spin_l.setRange(0, 2)
+        self.spin_l.setValue(2)
+
+        self.label_m = QLabel("m:")
+        self.spin_m = QSpinBox()
+        self.spin_m.setRange(-2, 2)
+        self.spin_m.setValue(0)
+
+        for widget in [self.label_n, self.spin_n, self.label_l, self.spin_l, self.label_m, self.spin_m]:
+            toolbar_layout.addWidget(widget)
+
+        # Update-Logik für Quantenzahlen
+        self.spin_n.valueChanged.connect(self.update_limits)
+        self.spin_l.valueChanged.connect(self.update_limits)
+
+        # Punkte Setup
+        toolbar_layout.addWidget(QLabel("Punkte:"))
         self.points_spinbox = QSpinBox()
-        self.points_spinbox.setRange(1000, 50000000)
+        self.points_spinbox.setRange(1000, 1000000)
         self.points_spinbox.setSingleStep(10000)
         self.points_spinbox.setValue(40000)
         self.points_spinbox.setKeyboardTracking(False)
-        self.points_spinbox.valueChanged.connect(self.update_orbital)
         toolbar_layout.addWidget(self.points_spinbox)
 
         self.status_label = QLabel("Status: Bereit")
-        self.status_label.setStyleSheet("color: #45a29e; font-style: italic; border: none; margin-left: 20px;")
         toolbar_layout.addWidget(self.status_label)
-
         toolbar_layout.addStretch()
         main_layout.addWidget(toolbar)
 
+        # Re-Render Auslöser
+        self.spin_n.valueChanged.connect(self.update_orbital)
+        self.spin_l.valueChanged.connect(self.update_orbital)
+        self.spin_m.valueChanged.connect(self.update_orbital)
+        self.points_spinbox.valueChanged.connect(self.update_orbital)
+
+        # 3D View
         self.view = gl.GLViewWidget()
-        self.view.setCameraPosition(distance=25, elevation=20, azimuth=45)
+        self.view.setCameraPosition(distance=30, elevation=20, azimuth=45)
         main_layout.addWidget(self.view, stretch=1)
-
-        grid = gl.GLGridItem()
-        grid.scale(1, 1, 1)
-        grid.setColor((80, 80, 80, 100))
-        self.view.addItem(grid)
-
         self.scatter = gl.GLScatterPlotItem(size=2, pxMode=True)
         self.scatter.setGLOptions('additive')
         self.view.addItem(self.scatter)
 
         self.update_orbital()
 
+    def update_limits(self):
+        """Passt die maximal/minimal erlaubten Werte für l und m basierend auf n an."""
+        n = self.spin_n.value()
+        self.spin_l.setMaximum(n - 1)
+
+        l = self.spin_l.value()
+        self.spin_m.setMinimum(-l)
+        self.spin_m.setMaximum(l)
+
+    def toggle_mode(self):
+        is_atomic = (self.combo.currentIndex() == 0)
+        for w in [self.label_n, self.spin_n, self.label_l, self.spin_l, self.label_m, self.spin_m]:
+            w.setVisible(is_atomic)
+        self.update_orbital()
+
     def update_orbital(self):
-        self.status_label.setText("Status: Berechne... (Bitte warten)")
-        self.status_label.setStyleSheet("color: #ffcc00; font-style: italic; border: none; margin-left: 20px;")
+        self.status_label.setText("Status: Berechne...")
+        self.status_label.setStyleSheet("color: #ffcc00;")
         QApplication.processEvents()
 
-        selection = self.combo.currentText()
+        orb_type = self.combo.currentIndex()
+        n = self.spin_n.value()
+        l = self.spin_l.value()
+        m = self.spin_m.value()
         num_points = self.points_spinbox.value()
 
-        if "1s" in selection:
-            pdf, color_base = pdf_1s, [0.1, 0.5, 1.0]
-        elif "2s" in selection:
-            pdf, color_base = pdf_2s, [1.0, 0.3, 0.1]
-        elif "2p_x" in selection:
-            pdf, color_base = pdf_2px, [0.8, 0.2, 0.5]
-        elif "2p_y" in selection:
-            pdf, color_base = pdf_2py, [0.8, 0.8, 0.2]
-        elif "2p_z" in selection:
-            pdf, color_base = pdf_2pz, [0.2, 0.9, 0.4]
-        elif "3d_z²" in selection:
-            pdf, color_base = pdf_3dz2, [0.6, 0.2, 1.0]
-        elif "3d_x²-y²" in selection:
-            pdf, color_base = pdf_3dx2y2, [0.2, 0.8, 0.8]
-        elif "bindendes" in selection:
-            pdf, color_base = pdf_h2_bonding, [0.2, 0.9, 0.9]
-        elif "antibindendes" in selection:
-            pdf, color_base = pdf_h2_antibonding, [0.9, 0.2, 0.2]
+        # Automatische Anpassung der Schrittweite: Größere Orbitale (höheres n) brauchen größere Schritte
+        step = n * 0.75 if orb_type == 0 else 1.5
 
-        step = 1.5 if ("3d" in selection or "H2" in selection) else 1.0
+        # Farbgebung dynamisch nach Orbitalform (l)
+        if orb_type == 0:
+            if l == 0:
+                color_base = [0.1, 0.5, 1.0]  # s: Blau
+            elif l == 1:
+                color_base = [0.8, 0.2, 0.5]  # p: Pink/Rot
+            elif l == 2:
+                color_base = [0.2, 0.9, 0.4]  # d: Grün
+            elif l == 3:
+                color_base = [1.0, 0.6, 0.0]  # f: Orange
+            else:
+                color_base = [0.8, 0.8, 0.8]  # g, h...: Weiß/Grau
+        elif orb_type == 1:
+            color_base = [0.2, 0.9, 0.9]  # H2 bindend
+        else:
+            color_base = [0.9, 0.2, 0.2]  # H2 antibindend
 
-        # Der Metropolis-Aufruf. Numba kompiliert die Funktion beim jeweils ersten
-        # Aufruf mit einer neuen PDF. Das dauert initial ca. 0.5 Sekunden,
-        # danach läuft es in Echtzeit.
-        positions = metropolis_hastings(pdf, num_points=num_points, thin=5, step_size=step)
+        positions = metropolis_hastings(orb_type, n, l, m, num_points=num_points, thin=5, step_size=step)
 
         colors = np.ones((len(positions), 4))
-        colors[:, 0] = color_base[0]
-        colors[:, 1] = color_base[1]
-        colors[:, 2] = color_base[2]
-        colors[:, 3] = 0.06
+        colors[:, :3] = color_base
+        colors[:, 3] = 0.06  # Alpha-Transparenz
 
         self.scatter.setData(pos=positions, color=colors)
 
-        self.status_label.setText(f"Status: Fertig ({num_points:,} Punkte)".replace(',', '.'))
-        self.status_label.setStyleSheet("color: #45a29e; font-style: italic; border: none; margin-left: 20px;")
+        # Kamera etwas herauszoomen, wenn das Orbital sehr groß ist
+        if orb_type == 0:
+            self.view.setCameraPosition(distance=max(25, n * 8))
+
+        self.status_label.setText(f"Status: Fertig ({num_points:,} Punkte)")
+        self.status_label.setStyleSheet("color: #45a29e;")
 
 
-def main():
+if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = OrbitalApp()
     window.show()
     sys.exit(app.exec())
-
-
-if __name__ == '__main__':
-    main()
